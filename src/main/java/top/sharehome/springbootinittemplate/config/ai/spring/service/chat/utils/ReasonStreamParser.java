@@ -1,9 +1,9 @@
-package top.sharehome.springbootinittemplate.config.ai.spring.service.chat.utils;
+package top.sharehome.policybackend.ai.service.chat.utils;
 
 import org.apache.commons.lang3.StringUtils;
 
 /**
- * 深度思考流解析器
+ * 深度思考流解析器（全程实时流式输出版）
  *
  * @author AntonyCheng
  */
@@ -15,14 +15,15 @@ public class ReasonStreamParser {
 
     /**
      * 是否为思维链模式。
-     * false → 完全透传，所有内容实时输出到 reply，isOrphanEndTag 此时无意义。
+     * false → 所有内容实时透传到 reply，isOrphanEndTag 此时无意义。
      */
     private final boolean isReasoningMode;
 
     /**
      * 是否为孤立结束标签模式（仅在 isReasoningMode=true 时生效）。
-     * true  → 以孤立的 {@code </think>} 作为分隔符，之前内容为 think，之后为 reply。
-     * false → 标准 {@code <think>...</think>} 模式。
+     * true  → 流开始即实时输出 think，遇到孤立 {@code </think>} 后切换输出 reply。
+     * false → 标准 {@code <think>...</think>} 模式，遇到 {@code <think>} 后实时输出 think，
+     *         遇到 {@code </think>} 后切换输出 reply；{@code <think>} 之前的内容输出到 reply。
      */
     private final boolean isOrphanEndTag;
 
@@ -33,19 +34,16 @@ public class ReasonStreamParser {
     private final StringBuilder thinkContent = new StringBuilder();
     private final StringBuilder replyContent = new StringBuilder();
 
-    /**
-     * 孤立标签模式下，在遇到 {@code </think>} 之前内容暂存于此。
-     * 遇到 {@code </think>} 后整体转移到 thinkContent；
-     * 流结束仍未遇到则整体转移到 replyContent。
-     */
-    private final StringBuilder pendingBuffer = new StringBuilder();
-
     // ----------------------------------------------------------------
     // 增量位置追踪（供 getXxxIncrement() 方法使用）
     // ----------------------------------------------------------------
 
     private int lastRetrievedThinkLength = 0;
     private int lastRetrievedReplyLength = 0;
+
+    // 用于触发增量回调的长度记录
+    private int lastThinkContentLength = 0;
+    private int lastReplyContentLength = 0;
 
     // ----------------------------------------------------------------
     // 标准模式状态
@@ -55,36 +53,26 @@ public class ReasonStreamParser {
     private boolean thinkTagComplete = false;
     private int thinkTagDepth = 0;
 
-    // 用于触发增量回调的长度记录
-    private int lastThinkContentLength = 0;
-    private int lastReplyContentLength = 0;
-
     // ----------------------------------------------------------------
     // 孤立标签模式状态
     // ----------------------------------------------------------------
 
-    /**
-     * 孤立标签模式下的阶段：
-     * PENDING  → 尚未遇到 {@code </think>}，内容暂存 pendingBuffer
-     * REPLY    → 已遇到 {@code </think>}，后续内容直接写入 replyContent
-     */
-    private enum OrphanPhase {
-        PENDING, REPLY
-    }
-
-    private OrphanPhase orphanPhase = OrphanPhase.PENDING;
+    private boolean orphanThinkComplete = false;
 
     // ----------------------------------------------------------------
     // 标签匹配状态机（标准模式 & 孤立标签模式共用）
     // ----------------------------------------------------------------
 
     private enum TagState {
-        NORMAL,
-        MATCHING_START,
-        MATCHING_END
+        NORMAL, MATCHING
     }
 
     private TagState currentState = TagState.NORMAL;
+
+    /**
+     * 标签字符匹配缓冲区，最多暂存 max(START_TAG, END_TAG).length - 1 = 8 个字符，
+     * 一旦确认匹配成功或失败立即清空，不会积压正文内容。
+     */
     private final StringBuilder tagBuffer = new StringBuilder();
 
     // ----------------------------------------------------------------
@@ -100,7 +88,6 @@ public class ReasonStreamParser {
 
     public ReasonStreamParser(boolean isReasoningMode, boolean isOrphanEndTag) {
         this.isReasoningMode = isReasoningMode;
-        // 非思维链模式下，孤立标签参数强制为 false，避免歧义
         this.isOrphanEndTag = isReasoningMode && isOrphanEndTag;
     }
 
@@ -123,23 +110,11 @@ public class ReasonStreamParser {
     }
 
     /**
-     * 流结束时调用。
-     * 孤立标签模式下，若始终未遇到 {@code </think>}，将 pendingBuffer 整体作为 reply 释放。
+     * 流结束时调用，将 tagBuffer 中可能残留的字符冲入当前目标缓冲区。
      */
     public void finish() {
-        if (isReasoningMode && isOrphanEndTag && orphanPhase == OrphanPhase.PENDING) {
-            // 先把 tagBuffer 里可能残留的内容也冲入 pendingBuffer
-            if (tagBuffer.length() > 0) {
-                pendingBuffer.append(tagBuffer);
-                tagBuffer.setLength(0);
-            }
-            // 整体作为 reply 释放
-            flushPendingToReply();
-        } else {
-            // 标准模式 / 非思维链模式：tagBuffer 里残留内容按当前状态冲出
-            if (tagBuffer.length() > 0) {
-                flushTagBufferBasedOnState();
-            }
+        if (!tagBuffer.isEmpty()) {
+            flushTagBufferToCurrent();
         }
     }
 
@@ -149,7 +124,6 @@ public class ReasonStreamParser {
 
     private void processChar(char c) {
         if (!isReasoningMode) {
-            // 非思维链模式：完全透传
             appendToReply(c);
             return;
         }
@@ -162,141 +136,80 @@ public class ReasonStreamParser {
 
     // ----------------------------------------------------------------
     // 孤立标签模式处理
+    // 流开始即实时写入 think，遇到 </think> 后切换写入 reply
     // ----------------------------------------------------------------
 
-    /**
-     * 孤立标签模式下的字符处理
-     */
     private void processCharOrphan(char c) {
-        if (orphanPhase == OrphanPhase.REPLY) {
-            // 已找到 </think>，后续直接写入 reply
+        if (orphanThinkComplete) {
+            // 已过 </think>，直接写入 reply
             appendToReply(c);
             return;
         }
-
-        // PENDING 阶段：监听 </think>
-        switch (currentState) {
-            case NORMAL:
-                if (c == '<') {
-                    tagBuffer.setLength(0);
-                    tagBuffer.append(c);
-                    currentState = TagState.MATCHING_START;
-                } else {
-                    pendingBuffer.append(c);
-                }
-                break;
-
-            case MATCHING_START:
+        if (currentState == TagState.NORMAL) {
+            if (c == '<') {
+                tagBuffer.setLength(0);
                 tagBuffer.append(c);
-                if ("</".contentEquals(tagBuffer)) {
-                    currentState = TagState.MATCHING_END;
-                } else if (END_TAG.startsWith(tagBuffer.toString())) {
-                    // 继续等待，可能是 </think> 的前缀
-                } else {
-                    // 不是 </think>，冲入 pendingBuffer
-                    pendingBuffer.append(tagBuffer);
-                    tagBuffer.setLength(0);
-                    currentState = TagState.NORMAL;
-                }
-                break;
-
-            case MATCHING_END:
-                tagBuffer.append(c);
-                if (tagBuffer.toString().equals(END_TAG)) {
-                    // 命中孤立 </think>
-                    handleOrphanEndTag();
-                    currentState = TagState.NORMAL;
-                    tagBuffer.setLength(0);
-                } else if (!END_TAG.startsWith(tagBuffer.toString())) {
-                    // 不匹配，冲入 pendingBuffer
-                    pendingBuffer.append(tagBuffer);
-                    tagBuffer.setLength(0);
-                    currentState = TagState.NORMAL;
-                }
-                break;
-        }
-    }
-
-    /**
-     * 命中孤立 {@code </think>}：将 pendingBuffer 整体转为 thinkContent，切换到 REPLY 阶段
-     */
-    private void handleOrphanEndTag() {
-        orphanPhase = OrphanPhase.REPLY;
-        // pendingBuffer 整体作为 think 内容
-        if (pendingBuffer.length() > 0) {
-            thinkContent.append(pendingBuffer);
-            pendingBuffer.setLength(0);
-            // 触发 think 增量回调（批量）
-            triggerThinkContentIncrement();
-        }
-        // 通知 think 内容完成
-        onThinkContentComplete(thinkContent.toString());
-    }
-
-    /**
-     * 流结束仍未遇到 {@code </think>}：pendingBuffer 整体作为 reply
-     */
-    private void flushPendingToReply() {
-        if (pendingBuffer.length() > 0) {
-            replyContent.append(pendingBuffer);
-            pendingBuffer.setLength(0);
-            triggerReplyContentIncrement();
+                currentState = TagState.MATCHING;
+            } else {
+                // 直接实时写入 think
+                appendToThink(c);
+            }
+        } else {
+            tagBuffer.append(c);
+            String buf = tagBuffer.toString();
+            if (buf.equals(END_TAG)) {
+                // 命中 </think>，切换阶段
+                orphanThinkComplete = true;
+                thinkTagComplete = true;
+                onThinkContentComplete(thinkContent.toString());
+                currentState = TagState.NORMAL;
+                tagBuffer.setLength(0);
+            } else if (!END_TAG.startsWith(buf)) {
+                // 不是 </think> 前缀，将 tagBuffer 冲入 think
+                flushTagBufferToCurrent();
+            }
+            // 否则继续等待匹配
         }
     }
 
     // ----------------------------------------------------------------
-    // 标准模式处理（保留原有逻辑）
+    // 标准模式处理
+    // <think> 之前内容写入 reply，<think>...</think> 之间实时写入 think，之后写入 reply
     // ----------------------------------------------------------------
 
     private void processCharStandard(char c) {
-        if (!thinkTagComplete) {
-            processCharInThinkPhase(c);
-        } else {
+        if (thinkTagComplete) {
             appendToReply(c);
+            return;
         }
-    }
-
-    private void processCharInThinkPhase(char c) {
-        switch (currentState) {
-            case NORMAL:
-                if (c == '<') {
-                    tagBuffer.setLength(0);
-                    tagBuffer.append(c);
-                    currentState = TagState.MATCHING_START;
+        if (currentState == TagState.NORMAL) {
+            if (c == '<') {
+                tagBuffer.setLength(0);
+                tagBuffer.append(c);
+                currentState = TagState.MATCHING;
+            } else {
+                if (!foundFirstThinkStart) {
+                    appendToReply(c);
                 } else {
-                    if (!foundFirstThinkStart) {
-                        appendToReply(c);
-                    } else {
-                        addToCurrentContent(c);
-                    }
+                    appendToThink(c);
                 }
-                break;
-
-            case MATCHING_START:
-                tagBuffer.append(c);
-                if (tagBuffer.toString().equals(START_TAG)) {
-                    handleStartTag();
-                    currentState = TagState.NORMAL;
-                    tagBuffer.setLength(0);
-                } else if ("</".contentEquals(tagBuffer)) {
-                    currentState = TagState.MATCHING_END;
-                } else if (!START_TAG.startsWith(tagBuffer.toString()) && !END_TAG.startsWith(tagBuffer.toString())) {
-                    flushTagBufferBasedOnState();
-                    currentState = TagState.NORMAL;
-                }
-                break;
-
-            case MATCHING_END:
-                tagBuffer.append(c);
-                if (tagBuffer.toString().equals(END_TAG)) {
-                    handleEndTag();
-                    currentState = TagState.NORMAL;
-                    tagBuffer.setLength(0);
-                } else if (!END_TAG.startsWith(tagBuffer.toString())) {
-                    flushTagBufferBasedOnState();
-                    currentState = TagState.NORMAL;
-                }
-                break;
+            }
+        } else {
+            tagBuffer.append(c);
+            String buf = tagBuffer.toString();
+            if (buf.equals(START_TAG)) {
+                handleStartTag();
+                currentState = TagState.NORMAL;
+                tagBuffer.setLength(0);
+            } else if (buf.equals(END_TAG)) {
+                handleEndTag();
+                currentState = TagState.NORMAL;
+                tagBuffer.setLength(0);
+            } else if (!START_TAG.startsWith(buf) && !END_TAG.startsWith(buf)) {
+                // 两个标签的前缀都不匹配，冲出 tagBuffer
+                flushTagBufferToCurrent();
+            }
+            // 否则继续等待匹配
         }
     }
 
@@ -305,9 +218,9 @@ public class ReasonStreamParser {
             foundFirstThinkStart = true;
             thinkTagDepth = 1;
         } else {
-            thinkContent.append(START_TAG);
+            // 嵌套 <think>，作为正文内容写入 think
             thinkTagDepth++;
-            triggerThinkContentIncrement();
+            appendStringToThink(START_TAG);
         }
     }
 
@@ -318,34 +231,61 @@ public class ReasonStreamParser {
                 thinkTagComplete = true;
                 onThinkContentComplete(thinkContent.toString());
             } else {
-                thinkContent.append(END_TAG);
-                triggerThinkContentIncrement();
+                // 嵌套闭合，作为正文内容写入 think
+                appendStringToThink(END_TAG);
             }
         } else {
-            for (char c : END_TAG.toCharArray()) {
-                appendToReply(c);
-            }
-        }
-    }
-
-    private void addToCurrentContent(char c) {
-        if (foundFirstThinkStart && !thinkTagComplete) {
-            thinkContent.append(c);
-            triggerThinkContentIncrement();
-        } else if (thinkTagComplete) {
-            appendToReply(c);
+            // 从未出现过 <think>，</think> 作为普通文本写入 reply
+            appendStringToReply(END_TAG);
         }
     }
 
     // ----------------------------------------------------------------
-    // 公共写入 & 回调触发
+    // tagBuffer 冲出：根据当前状态决定写入 think 还是 reply
     // ----------------------------------------------------------------
+
+    private void flushTagBufferToCurrent() {
+        String buf = tagBuffer.toString();
+        tagBuffer.setLength(0);
+        currentState = TagState.NORMAL;
+        if (isInThinkPhase()) {
+            appendStringToThink(buf);
+        } else {
+            appendStringToReply(buf);
+        }
+    }
 
     /**
-     * 将字符写入 replyContent 并触发增量回调
+     * 判断当前是否处于"写入 think"阶段
      */
+    private boolean isInThinkPhase() {
+        if (isOrphanEndTag) {
+            return !orphanThinkComplete;
+        }
+        return foundFirstThinkStart && !thinkTagComplete;
+    }
+
+    // ----------------------------------------------------------------
+    // 写入 & 增量回调触发
+    // ----------------------------------------------------------------
+
+    private void appendToThink(char c) {
+        thinkContent.append(c);
+        triggerThinkContentIncrement();
+    }
+
+    private void appendStringToThink(String s) {
+        thinkContent.append(s);
+        triggerThinkContentIncrement();
+    }
+
     private void appendToReply(char c) {
         replyContent.append(c);
+        triggerReplyContentIncrement();
+    }
+
+    private void appendStringToReply(String s) {
+        replyContent.append(s);
         triggerReplyContentIncrement();
     }
 
@@ -368,51 +308,19 @@ public class ReasonStreamParser {
         }
     }
 
-    private void flushTagBufferBasedOnState() {
-        String buffered = tagBuffer.toString();
-        for (char c : buffered.toCharArray()) {
-            if (!foundFirstThinkStart) {
-                appendToReply(c);
-            } else {
-                addToCurrentContent(c);
-            }
-        }
-        tagBuffer.setLength(0);
-    }
-
     // ----------------------------------------------------------------
     // 可重写的回调方法
     // ----------------------------------------------------------------
 
-    /**
-     * think 内容完成时的回调
-     *
-     * @param thinkContent 完整的思考内容
-     */
     public void onThinkContentComplete(String thinkContent) {
     }
 
-    /**
-     * think 内容增量回调（每次新增内容时触发）
-     *
-     * @param increment 新增的思考内容
-     */
     public void onThinkContentIncrement(String increment) {
     }
 
-    /**
-     * 回复内容更新时的回调（每次新增时携带完整内容）
-     *
-     * @param replyContent 当前完整的回复内容
-     */
     public void onReplyContentUpdate(String replyContent) {
     }
 
-    /**
-     * 回复内容增量回调（每次新增内容时触发）
-     *
-     * @param increment 新增的回复内容
-     */
     public void onReplyContentIncrement(String increment) {
     }
 
@@ -420,17 +328,11 @@ public class ReasonStreamParser {
     // Getter 方法
     // ----------------------------------------------------------------
 
-    /**
-     * 获取当前的 think 内容
-     */
     public String getThinkContent() {
         String res = thinkContent.toString().trim();
         return StringUtils.isNotBlank(res) ? res : StringUtils.EMPTY;
     }
 
-    /**
-     * 获取 think 内容的增量部分（自上次调用后新增的部分）
-     */
     public String getThinkContentIncrement() {
         int currentLength = thinkContent.length();
         if (currentLength > lastRetrievedThinkLength) {
@@ -441,17 +343,11 @@ public class ReasonStreamParser {
         return StringUtils.EMPTY;
     }
 
-    /**
-     * 获取当前的回复内容
-     */
     public String getReplyContent() {
         String res = replyContent.toString();
         return StringUtils.isNotBlank(res) ? res.trim() : StringUtils.EMPTY;
     }
 
-    /**
-     * 获取 reply 内容的增量部分（自上次调用后新增的部分）
-     */
     public String getReplyContentIncrement() {
         int currentLength = replyContent.length();
         if (currentLength > lastRetrievedReplyLength) {
@@ -462,22 +358,16 @@ public class ReasonStreamParser {
         return StringUtils.EMPTY;
     }
 
-    /**
-     * 是否检测到 think 标签（标准模式）或已命中孤立 {@code </think>}（孤立标签模式）
-     */
     public boolean hasThinkContent() {
         if (isOrphanEndTag) {
-            return orphanPhase == OrphanPhase.REPLY;
+            return orphanThinkComplete;
         }
         return foundFirstThinkStart;
     }
 
-    /**
-     * think 内容是否已完成解析
-     */
     public boolean isThinkComplete() {
         if (isOrphanEndTag) {
-            return orphanPhase == OrphanPhase.REPLY;
+            return orphanThinkComplete;
         }
         return thinkTagComplete;
     }
@@ -486,13 +376,9 @@ public class ReasonStreamParser {
     // 重置
     // ----------------------------------------------------------------
 
-    /**
-     * 重置解析器到初始状态（构造参数保持不变）
-     */
     public void reset() {
         thinkContent.setLength(0);
         replyContent.setLength(0);
-        pendingBuffer.setLength(0);
         lastRetrievedThinkLength = 0;
         lastRetrievedReplyLength = 0;
         lastThinkContentLength = 0;
@@ -500,7 +386,7 @@ public class ReasonStreamParser {
         foundFirstThinkStart = false;
         thinkTagComplete = false;
         thinkTagDepth = 0;
-        orphanPhase = OrphanPhase.PENDING;
+        orphanThinkComplete = false;
         currentState = TagState.NORMAL;
         tagBuffer.setLength(0);
     }
